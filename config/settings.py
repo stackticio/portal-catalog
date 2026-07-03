@@ -59,6 +59,12 @@ AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
+# --- Real-time bidding: Kafka HTTP Bridge (set in the catalog-svc configmap) ---
+# external_source_code has no native Kafka topic link, so Django produces/consumes
+# over the Strimzi bridge REST API instead of the native protocol.
+KAFKA_BRIDGE_URL = os.environ.get("KAFKA_BRIDGE_URL")
+KAFKA_BIDS_TOPIC = os.environ.get("KAFKA_BIDS_TOPIC", "bids")
+
 CORS_ALLOW_ALL_ORIGINS = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

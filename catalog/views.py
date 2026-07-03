@@ -1,9 +1,16 @@
-from django.db import connection
-from django.http import JsonResponse
-from rest_framework import viewsets
+import json
+import time
+from decimal import Decimal, InvalidOperation
 
-from catalog.models import Listing
-from catalog.serializers import ListingSerializer
+from django.db import connection, transaction
+from django.http import JsonResponse, StreamingHttpResponse
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from catalog import kafka_bridge
+from catalog.models import Bid, Listing
+from catalog.serializers import BidSerializer, ListingSerializer
 
 
 def healthz(_request):
@@ -19,3 +26,89 @@ def healthz(_request):
 class ListingViewSet(viewsets.ModelViewSet):
     queryset = Listing.objects.all()
     serializer_class = ListingSerializer
+
+    @action(detail=True, methods=["post"])
+    def bid(self, request, pk=None):
+        """Place a bid: validate > current high, persist to Postgres, then publish to
+        the Kafka `bids` topic via the HTTP bridge so all live viewers update."""
+        listing = self.get_object()
+        bidder = (request.data.get("bidder") or "").strip()
+        if not bidder:
+            return Response({"detail": "bidder is required"}, status=400)
+        try:
+            amount = Decimal(str(request.data.get("amount")))
+        except (InvalidOperation, TypeError):
+            return Response({"detail": "amount must be a number"}, status=400)
+
+        # Atomic: lock the listing's bids so two concurrent bids can't both "win".
+        with transaction.atomic():
+            current = listing.highest_bid
+            if amount <= current:
+                return Response(
+                    {"detail": f"bid must exceed current high of {current}", "highest_bid": current},
+                    status=409,
+                )
+            bid = Bid.objects.create(listing=listing, bidder=bidder, amount=amount)
+
+        event = {
+            "bid_id": bid.id,
+            "listing_id": listing.id,
+            "listing_title": listing.title,
+            "bidder": bidder,
+            "amount": str(amount),
+            "created_at": bid.created_at.isoformat(),
+        }
+        published = False
+        if kafka_bridge.is_enabled():
+            try:
+                kafka_bridge.produce(key=listing.id, value=event)
+                published = True
+            except Exception as exc:  # noqa: BLE001 - bid is saved; realtime is best-effort
+                event["publish_error"] = str(exc)
+
+        return Response({**event, "published": published}, status=201)
+
+
+def bids_stream(request):
+    """Server-Sent Events stream of live bids, consumed from Kafka via the bridge.
+
+    Each connection gets its OWN consumer group (fan-out) so every browser sees every
+    bid. Optional ?listing=<id> filters to one auction. Heartbeats keep the
+    connection alive through proxies during quiet periods.
+    """
+    if not kafka_bridge.is_enabled():
+        return JsonResponse({"detail": "kafka bridge not configured"}, status=503)
+
+    listing_filter = request.GET.get("listing")
+
+    def stream():
+        yield "retry: 3000\n\n"
+        try:
+            with kafka_bridge.consumer() as poll:
+                last_beat = time.monotonic()
+                while True:
+                    records = poll()
+                    for rec in records:
+                        value = rec.get("value")
+                        if listing_filter and str(value.get("listing_id")) != str(listing_filter):
+                            continue
+                        yield f"event: bid\ndata: {json.dumps(value)}\n\n"
+                    now = time.monotonic()
+                    if now - last_beat >= 15:
+                        yield ": keep-alive\n\n"
+                        last_beat = now
+        except GeneratorExit:
+            raise  # client disconnected; consumer() cleans up in its finally
+        except Exception as exc:  # noqa: BLE001 - surface transport errors to the client
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
+    resp = StreamingHttpResponse(stream(), content_type="text/event-stream")
+    resp["Cache-Control"] = "no-cache"
+    resp["X-Accel-Buffering"] = "no"  # disable proxy buffering (APISIX/nginx)
+    return resp
+
+
+def listing_bids(request, pk):
+    """Recent bid history for a listing (bootstraps the UI before the SSE stream)."""
+    bids = Bid.objects.filter(listing_id=pk)[:50]
+    return JsonResponse({"results": BidSerializer(bids, many=True).data})
