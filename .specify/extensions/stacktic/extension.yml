@@ -1,0 +1,47 @@
+schema_version: "1.0"
+
+extension:
+  id: stacktic
+  name: "Stacktic Platform Integration"
+  version: "1.0.0"
+  description: "Grounds every spec/plan in the live Stacktic stack: real wiring facts in, infrastructure changes out via the platform, deployed-state verification."
+  author: stacktic
+  repository: https://github.com/stackticio/mcp-ai-knowledge
+  license: MIT
+
+requires:
+  speckit_version: ">=0.2.0"
+
+provides:
+  commands:
+    - name: speckit.stacktic.stack
+      file: commands/speckit.stacktic.stack.md
+      description: "Load this service's live stack facts (wiring, env contract, neighbors) into the working context"
+    - name: speckit.stacktic.wire
+      file: commands/speckit.stacktic.wire.md
+      description: "Turn the plan's infrastructure needs into Stacktic link/component changes (confirmed, via the MCP design tool)"
+    - name: speckit.stacktic.verify
+      file: commands/speckit.stacktic.verify.md
+      description: "Verify the implementation against the DEPLOYED stack (live tests, env contract)"
+
+hooks:
+  before_plan:
+    command: speckit.stacktic.stack
+    optional: false
+    description: "Load live stack facts so the plan is grounded in real wiring, not assumptions"
+  after_plan:
+    command: speckit.stacktic.wire
+    optional: true
+    prompt: "Turn the plan's infrastructure needs into Stacktic stack changes now?"
+    description: "Route infrastructure items to the platform (links/components), never manifests"
+  after_implement:
+    command: speckit.stacktic.verify
+    optional: true
+    prompt: "Verify the implementation against the deployed stack?"
+    description: "Live verification via Stacktic stack-tests"
+
+tags:
+  - "stacktic"
+  - "platform"
+  - "infrastructure"
+  - "kubernetes"

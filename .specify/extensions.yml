@@ -1,0 +1,21 @@
+hooks:
+  before_plan:
+    - extension: stacktic
+      command: speckit.stacktic.stack
+      enabled: true
+      optional: false
+      description: "Load live stack facts so the plan is grounded in real wiring"
+  after_plan:
+    - extension: stacktic
+      command: speckit.stacktic.wire
+      enabled: true
+      optional: true
+      prompt: "Turn the plan's infrastructure needs into Stacktic stack changes now?"
+      description: "Route infrastructure to the platform (links/components), never manifests"
+  after_implement:
+    - extension: stacktic
+      command: speckit.stacktic.verify
+      enabled: true
+      optional: true
+      prompt: "Verify the implementation against the deployed stack?"
+      description: "Live verification via Stacktic stack-tests"

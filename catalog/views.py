@@ -8,9 +8,17 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from catalog import kafka_bridge
+from catalog import kafka_bridge, kafka_native
 from catalog.models import Bid, Listing
 from catalog.serializers import BidSerializer, ListingSerializer
+
+
+def kafka_health(request):
+    """Prove native mTLS Kafka works end-to-end: connect (client cert trusted by the
+    broker CA) -> fetch topic metadata (Describe ACL) -> produce a record (Write ACL).
+    GET /api/catalog/kafka/health/  (?produce=0 to skip the write)."""
+    result = kafka_native.health(do_produce=request.GET.get("produce", "1") != "0")
+    return JsonResponse(result, status=200 if result.get("ok") else 503)
 
 
 def healthz(_request):
