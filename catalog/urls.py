@@ -1,10 +1,17 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
-from catalog.views import ListingViewSet, bids_stream, kafka_health, listing_bids
+from catalog.views import (
+    CategoryViewSet,
+    ListingViewSet,
+    bids_stream,
+    kafka_health,
+    listing_bids,
+)
 
 router = DefaultRouter()
 router.register("listings", ListingViewSet, basename="listing")
+router.register("categories", CategoryViewSet, basename="category")
 
 urlpatterns = [
     # Native mTLS Kafka connectivity check (connect + metadata + produce).

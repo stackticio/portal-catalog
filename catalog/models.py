@@ -1,13 +1,47 @@
 from django.db import models
+from django.utils.text import slugify
+
+
+class Category(models.Model):
+    """A top-level marketplace category (Electronics, Fashion, ...)."""
+
+    name = models.CharField(max_length=80, unique=True)
+    slug = models.SlugField(max_length=90, unique=True, blank=True)
+    emoji = models.CharField(max_length=8, blank=True)
+    order = models.PositiveIntegerField(default=100)
+
+    class Meta:
+        ordering = ["order", "name"]
+        verbose_name_plural = "categories"
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
 
 
 class Listing(models.Model):
     """A product listing in the eBay-like portal."""
 
+    CONDITION_CHOICES = [
+        ("new", "New"),
+        ("like_new", "Like new"),
+        ("used", "Used"),
+        ("refurbished", "Refurbished"),
+    ]
+
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2)
     seller = models.CharField(max_length=120, blank=True)
+    category = models.ForeignKey(
+        Category, related_name="listings", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    condition = models.CharField(max_length=20, choices=CONDITION_CHOICES, default="used")
+    location = models.CharField(max_length=120, blank=True)
     # Object key in the SeaweedFS S3 bucket (image bytes live in object storage, not the DB).
     image_key = models.CharField(max_length=300, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -9,8 +9,8 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from catalog import kafka_bridge, kafka_native
-from catalog.models import Bid, Listing
-from catalog.serializers import BidSerializer, ListingSerializer
+from catalog.models import Bid, Category, Listing
+from catalog.serializers import BidSerializer, CategorySerializer, ListingSerializer
 
 
 def kafka_health(request):
@@ -31,9 +31,23 @@ def healthz(_request):
         return JsonResponse({"status": "degraded", "error": str(exc)}, status=503)
 
 
+class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only list of marketplace categories (with per-category item counts)."""
+
+    queryset = Category.objects.all()
+    serializer_class = CategorySerializer
+
+
 class ListingViewSet(viewsets.ModelViewSet):
-    queryset = Listing.objects.all()
     serializer_class = ListingSerializer
+
+    def get_queryset(self):
+        """All listings, optionally filtered to one category via ?category=<slug>."""
+        qs = Listing.objects.select_related("category").all()
+        slug = self.request.query_params.get("category")
+        if slug:
+            qs = qs.filter(category__slug=slug)
+        return qs
 
     @action(detail=True, methods=["post"])
     def bid(self, request, pk=None):

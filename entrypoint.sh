@@ -4,6 +4,9 @@ set -e
 # Apply DB migrations before serving (safe to run on every start; no-op when up to date).
 python manage.py migrate --noinput
 
+# Seed demo categories + listings (idempotent by name/title; safe on every start).
+python manage.py seed || true
+
 # gthread workers: the live-bid SSE stream holds a connection open for the life of the
 # browser tab. Threads (not whole sync workers) service those long-lived requests, so
 # many viewers can watch an auction without starving request handling. --timeout 0
