@@ -112,6 +112,11 @@ OIDC_TOKEN_URL = os.environ.get("OIDC_TOKEN_URL") or (
 OIDC_AUTHORIZATION_URL = os.environ.get("OIDC_AUTHORIZATION_URL") or (
     f"{OIDC_ISSUER}/protocol/openid-connect/auth" if OIDC_ISSUER else ""
 )
+# Self-registration creates users through the Keycloak Admin API, which is only
+# reachable IN-CLUSTER (the public /admin route is blocked at the gateway). This is
+# the internal service base; OIDC_REALM is parsed from the issuer.
+OIDC_ADMIN_BASE = os.environ.get("OIDC_ADMIN_BASE", "").rstrip("/")
+OIDC_REALM = OIDC_ISSUER.rsplit("/realms/", 1)[-1] if "/realms/" in OIDC_ISSUER else ""
 
 # --- API authorization: browse is public; writes (create listing, place bid)
 # require a valid Keycloak token. Falls back to open when OIDC is unset (local dev). ---

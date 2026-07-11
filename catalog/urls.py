@@ -7,6 +7,7 @@ from catalog.views import (
     auth_callback,
     auth_config,
     auth_login,
+    auth_register,
     bids_stream,
     kafka_health,
     listing_bids,
@@ -20,6 +21,7 @@ urlpatterns = [
     # Keycloak hosted-login (Authorization-Code redirect) flow.
     path("auth/config/", auth_config, name="auth-config"),
     path("auth/callback/", auth_callback, name="auth-callback"),
+    path("auth/register/", auth_register, name="auth-register"),
     # Alternate direct-grant proxy (scripted clients).
     path("auth/login/", auth_login, name="auth-login"),
     # Native mTLS Kafka connectivity check (connect + metadata + produce).

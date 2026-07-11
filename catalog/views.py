@@ -256,3 +256,92 @@ def auth_login(request):
             "username": username,
         }
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def auth_register(request):
+    """Self-service sign-up: create a Keycloak user via the Admin API, then auto-login.
+
+    User creation uses the portal client's SERVICE ACCOUNT (client_credentials +
+    manage-users role) against the INTERNAL Keycloak service — the public /admin route
+    is blocked at the gateway. Auto-login uses the PUBLIC token endpoint so the issued
+    token's `iss` matches what catalog/auth.py validates on subsequent writes.
+    """
+    if not (settings.OIDC_ADMIN_BASE and settings.OIDC_REALM):
+        return Response({"detail": "registration is not configured"}, status=503)
+    d = request.data
+    username = (d.get("username") or "").strip()
+    email = (d.get("email") or "").strip()
+    password = d.get("password") or ""
+    first = (d.get("firstName") or "").strip()
+    last = (d.get("lastName") or "").strip()
+    if not username or not email or not password:
+        return Response({"detail": "username, email and password are required"}, status=400)
+
+    base, realm = settings.OIDC_ADMIN_BASE, settings.OIDC_REALM
+
+    # 1) service-account token (in-cluster)
+    try:
+        tr = requests.post(
+            f"{base}/realms/{realm}/protocol/openid-connect/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": settings.OIDC_CLIENT_ID,
+                "client_secret": settings.OIDC_CLIENT_SECRET,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return Response({"detail": f"auth server unreachable: {exc}"}, status=502)
+    if tr.status_code != 200:
+        return Response({"detail": "registration backend authentication failed"}, status=502)
+    admin_token = tr.json().get("access_token")
+
+    # 2) create the user
+    try:
+        cr = requests.post(
+            f"{base}/admin/realms/{realm}/users",
+            headers={"Authorization": f"Bearer {admin_token}", "Content-Type": "application/json"},
+            json={
+                "username": username,
+                "email": email,
+                "enabled": True,
+                "emailVerified": True,
+                "firstName": first,
+                "lastName": last,
+                "credentials": [{"type": "password", "value": password, "temporary": False}],
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return Response({"detail": f"auth server unreachable: {exc}"}, status=502)
+    if cr.status_code == 409:
+        return Response({"detail": "that username or email is already taken"}, status=409)
+    if cr.status_code not in (201, 204):
+        return Response({"detail": "could not create the account"}, status=400)
+
+    # 3) auto-login via the PUBLIC token endpoint (correct issuer for later validation)
+    payload = {"username": username, "access_token": None, "refresh_token": None, "expires_in": None}
+    if settings.OIDC_TOKEN_URL:
+        try:
+            lr = requests.post(
+                settings.OIDC_TOKEN_URL,
+                data={
+                    "grant_type": "password",
+                    "client_id": settings.OIDC_CLIENT_ID,
+                    "client_secret": settings.OIDC_CLIENT_SECRET,
+                    "username": username,
+                    "password": password,
+                    "scope": "openid",
+                },
+                timeout=10,
+            )
+            if lr.status_code == 200:
+                tok = lr.json()
+                payload["access_token"] = tok.get("access_token")
+                payload["refresh_token"] = tok.get("refresh_token")
+                payload["expires_in"] = tok.get("expires_in")
+        except requests.RequestException:
+            pass  # account exists; SPA falls back to the normal sign-in
+    return Response(payload, status=201)
