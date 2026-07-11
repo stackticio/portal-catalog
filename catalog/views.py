@@ -2,10 +2,13 @@ import json
 import time
 from decimal import Decimal, InvalidOperation
 
+import requests
+from django.conf import settings
 from django.db import connection, transaction
 from django.http import JsonResponse, StreamingHttpResponse
 from rest_framework import viewsets
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from catalog import kafka_bridge, kafka_native
@@ -49,21 +52,33 @@ class ListingViewSet(viewsets.ModelViewSet):
             qs = qs.filter(category__slug=slug)
         return qs
 
+    def perform_create(self, serializer):
+        # Seller is the authenticated token subject, never client-supplied.
+        serializer.save(seller=self.request.user.username)
+
     @action(detail=True, methods=["post"])
     def bid(self, request, pk=None):
-        """Place a bid: validate > current high, persist to Postgres, then publish to
-        the Kafka `bids` topic via the HTTP bridge so all live viewers update."""
+        """Place a bid: the bidder identity comes from the verified token (never the
+        request body), the amount must beat the current high, and the write happens
+        under a listing row lock; then publish to the Kafka `bids` topic so all live
+        viewers update."""
         listing = self.get_object()
-        bidder = (request.data.get("bidder") or "").strip()
-        if not bidder:
-            return Response({"detail": "bidder is required"}, status=400)
+        # IsAuthenticatedOrReadOnly has already rejected anonymous POSTs.
+        bidder = request.user.username
         try:
             amount = Decimal(str(request.data.get("amount")))
         except (InvalidOperation, TypeError):
             return Response({"detail": "amount must be a number"}, status=400)
 
-        # Atomic: lock the listing's bids so two concurrent bids can't both "win".
+        # Serialize concurrent bids on the SAME listing by taking a row lock on the
+        # listing (the mutex) BEFORE reading the current high. Without this the
+        # previous code held an atomic() block but locked nothing, so two bids could
+        # both pass the check below and both "win". select_for_update needs an open
+        # transaction; the second bidder blocks here until the first commits, then
+        # re-reads the now-higher current high. (No-op on the sqlite dev fallback;
+        # enforced on Postgres in the cluster.)
         with transaction.atomic():
+            listing = Listing.objects.select_for_update().get(pk=listing.pk)
             current = listing.highest_bid
             if amount <= current:
                 return Response(
@@ -134,3 +149,110 @@ def listing_bids(request, pk):
     """Recent bid history for a listing (bootstraps the UI before the SSE stream)."""
     bids = Bid.objects.filter(listing_id=pk)[:50]
     return JsonResponse({"results": BidSerializer(bids, many=True).data})
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def auth_config(request):
+    """Public OIDC parameters the SPA needs to START the Keycloak hosted-login
+    redirect (Authorization-Code flow). client_id and the authorize endpoint are
+    public; the client secret is never sent — it's used only server-side in
+    /auth/callback/."""
+    if not settings.OIDC_AUTHORIZATION_URL:
+        return Response({"detail": "authentication is not configured"}, status=503)
+    return Response(
+        {
+            "authorization_endpoint": settings.OIDC_AUTHORIZATION_URL,
+            "client_id": settings.OIDC_CLIENT_ID,
+            "issuer": settings.OIDC_ISSUER,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def auth_callback(request):
+    """Finish the Keycloak hosted-login redirect: exchange the authorization `code`
+    for tokens using the confidential client secret (server-side only). The SPA then
+    stores the access_token and sends it as `Authorization: Bearer` on writes."""
+    if not settings.OIDC_TOKEN_URL:
+        return Response({"detail": "authentication is not configured"}, status=503)
+    code = request.data.get("code")
+    redirect_uri = request.data.get("redirect_uri")
+    if not code or not redirect_uri:
+        return Response({"detail": "code and redirect_uri are required"}, status=400)
+    try:
+        resp = requests.post(
+            settings.OIDC_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": settings.OIDC_CLIENT_ID,
+                "client_secret": settings.OIDC_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return Response({"detail": f"auth server unreachable: {exc}"}, status=502)
+    if resp.status_code != 200:
+        return Response({"detail": "code exchange failed"}, status=401)
+    tok = resp.json()
+    # Read the username from the returned token (server-to-server exchange, already
+    # trusted); the API re-verifies the signature on every subsequent write.
+    username = ""
+    try:
+        import jwt as _jwt
+
+        claims = _jwt.decode(tok.get("access_token", ""), options={"verify_signature": False})
+        username = claims.get("preferred_username", "")
+    except Exception:  # noqa: BLE001 - username is best-effort decoration
+        pass
+    return Response(
+        {
+            "access_token": tok.get("access_token"),
+            "refresh_token": tok.get("refresh_token"),
+            "expires_in": tok.get("expires_in"),
+            "username": username,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def auth_login(request):
+    """Alternate server-side login proxy (direct-grant): username+password -> tokens,
+    kept as a fallback for scripted/non-browser clients. Browser sign-in uses the
+    hosted-redirect flow above (auth_config + auth_callback)."""
+    if not settings.OIDC_TOKEN_URL:
+        return Response({"detail": "authentication is not configured"}, status=503)
+    username = (request.data.get("username") or "").strip()
+    password = request.data.get("password") or ""
+    if not username or not password:
+        return Response({"detail": "username and password are required"}, status=400)
+    try:
+        resp = requests.post(
+            settings.OIDC_TOKEN_URL,
+            data={
+                "grant_type": "password",
+                "client_id": settings.OIDC_CLIENT_ID,
+                "client_secret": settings.OIDC_CLIENT_SECRET,
+                "username": username,
+                "password": password,
+                "scope": "openid",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return Response({"detail": f"auth server unreachable: {exc}"}, status=502)
+    if resp.status_code != 200:
+        return Response({"detail": "invalid credentials"}, status=401)
+    tok = resp.json()
+    return Response(
+        {
+            "access_token": tok.get("access_token"),
+            "refresh_token": tok.get("refresh_token"),
+            "expires_in": tok.get("expires_in"),
+            "username": username,
+        }
+    )

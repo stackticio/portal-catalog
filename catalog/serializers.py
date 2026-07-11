@@ -29,6 +29,8 @@ class ListingSerializer(serializers.ModelSerializer):
             "category", "category_name", "condition", "condition_label", "location",
             "image_key", "image_url", "highest_bid", "created_at",
         ]
+        # seller is set server-side from the authenticated token, not the client.
+        read_only_fields = ["seller"]
 
     def get_image_url(self, obj):
         return presigned_image_url(obj.image_key)

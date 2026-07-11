@@ -18,7 +18,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
-ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if h.strip()]
+# When hosts are restricted (prod), still allow the kubelet HTTP probe, which sends
+# Host: <pod-ip>. The pod's own hostname resolves to its IP via the /etc/hosts entry
+# kubelet writes, so probes stay green without needing a "*" wildcard.
+if "*" not in ALLOWED_HOSTS:
+    import socket
+
+    try:
+        ALLOWED_HOSTS.append(socket.gethostbyname(socket.gethostname()))
+    except OSError:
+        pass
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
@@ -30,8 +40,11 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -65,7 +78,47 @@ AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 KAFKA_BRIDGE_URL = os.environ.get("KAFKA_BRIDGE_URL")
 KAFKA_BIDS_TOPIC = os.environ.get("KAFKA_BIDS_TOPIC", "bids")
 
-CORS_ALLOW_ALL_ORIGINS = True
+# --- CORS/CSRF: the SPA is served same-origin (APISIX routes /api/catalog to this
+# service under the portal host), so no cross-origin access is needed in the cluster.
+# Allow only origins explicitly listed via env (empty default = same-origin only). ---
+CORS_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("DJANGO_CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = [o.strip() for o in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()]
+
+# --- Security headers. APISIX terminates TLS and forwards X-Forwarded-Proto. ---
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+SESSION_COOKIE_SECURE = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SECURE = True
+# HSTS is opt-in (0 = off) so a TLS hiccup on a demo can't lock the domain; enable in prod.
+SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
+
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-REST_FRAMEWORK = {"DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"]}
+
+# --- Keycloak OIDC (env from the catalog-svc `configmap` -> pod Secret) ---
+# Bearer tokens are validated in catalog/auth.py. OIDC_TOKEN_URL is used by the
+# server-side login proxy so the confidential client secret never reaches the SPA.
+OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "").rstrip("/")
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "")
+OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "")
+OIDC_TOKEN_URL = os.environ.get("OIDC_TOKEN_URL") or (
+    f"{OIDC_ISSUER}/protocol/openid-connect/token" if OIDC_ISSUER else ""
+)
+OIDC_AUTHORIZATION_URL = os.environ.get("OIDC_AUTHORIZATION_URL") or (
+    f"{OIDC_ISSUER}/protocol/openid-connect/auth" if OIDC_ISSUER else ""
+)
+
+# --- API authorization: browse is public; writes (create listing, place bid)
+# require a valid Keycloak token. Falls back to open when OIDC is unset (local dev). ---
+if OIDC_ISSUER:
+    REST_FRAMEWORK = {
+        "DEFAULT_AUTHENTICATION_CLASSES": ["catalog.auth.KeycloakJWTAuthentication"],
+        "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticatedOrReadOnly"],
+    }
+else:
+    REST_FRAMEWORK = {"DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"]}
