@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from catalog.views import (
     CategoryViewSet,
     ListingViewSet,
+    OrderViewSet,
     auth_callback,
     auth_config,
     auth_login,
@@ -11,11 +12,17 @@ from catalog.views import (
     bids_stream,
     kafka_health,
     listing_bids,
+    listing_search,
+    me_bids,
+    me_listings,
+    me_profile,
+    me_watchlist,
 )
 
 router = DefaultRouter()
 router.register("listings", ListingViewSet, basename="listing")
 router.register("categories", CategoryViewSet, basename="category")
+router.register("orders", OrderViewSet, basename="order")
 
 urlpatterns = [
     # Keycloak hosted-login (Authorization-Code redirect) flow.
@@ -30,5 +37,12 @@ urlpatterns = [
     path("bids/stream/", bids_stream, name="bids-stream"),
     # Bid history for one listing.
     path("listings/<int:pk>/bids/", listing_bids, name="listing-bids"),
+    # Full-text catalog search & discovery (OpenSearch, DB fallback).
+    path("search/", listing_search, name="listing-search"),
+    # "My Account" (eBay-style): profile/settings, my listings, my bids, watchlist.
+    path("me/", me_profile, name="me-profile"),
+    path("me/listings/", me_listings, name="me-listings"),
+    path("me/bids/", me_bids, name="me-bids"),
+    path("me/watchlist/", me_watchlist, name="me-watchlist"),
     *router.urls,
 ]

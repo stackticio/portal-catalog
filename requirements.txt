@@ -9,3 +9,4 @@ django-cors-headers==4.3.1
 requests==2.32.3
 PyJWT[crypto]==2.9.0
 confluent-kafka==2.5.3
+opensearch-py==3.0.0

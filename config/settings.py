@@ -77,6 +77,22 @@ AWS_DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 # over the Strimzi bridge REST API instead of the native protocol.
 KAFKA_BRIDGE_URL = os.environ.get("KAFKA_BRIDGE_URL")
 KAFKA_BIDS_TOPIC = os.environ.get("KAFKA_BIDS_TOPIC", "bids")
+# Order lifecycle events (order.paid/shipped/completed). Empty until the `orders`
+# topic is wired to the platform → the publish is a best-effort no-op meanwhile.
+KAFKA_ORDERS_TOPIC = os.environ.get("KAFKA_ORDERS_TOPIC", "")
+
+# --- Search: OpenSearch (external_source_code-opensearch link). Powers full-text
+# catalog search — the app indexes listings on write and queries them at /search/.
+# Values come from the catalog-svc secret. Left empty in local dev, in which case the
+# search endpoint transparently falls back to a DB query (see catalog/opensearch_client.py). ---
+OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "")
+OPENSEARCH_USERNAME = os.environ.get("OPENSEARCH_USERNAME", "")
+OPENSEARCH_PASSWORD = os.environ.get("OPENSEARCH_PASSWORD", "")
+OPENSEARCH_VERIFY_CERTS = os.environ.get("OPENSEARCH_VERIFY_CERTS", "true").lower() == "true"
+# The link scopes the app user to an index pattern (e.g. "listings*"); the concrete
+# index we read/write is that pattern with the trailing wildcard stripped.
+OPENSEARCH_INDICES = os.environ.get("OPENSEARCH_INDICES", "listings*")
+OPENSEARCH_LISTINGS_INDEX = OPENSEARCH_INDICES.split(",")[0].strip().rstrip("*") or "listings"
 
 # --- CORS/CSRF: the SPA is served same-origin (APISIX routes /api/catalog to this
 # service under the portal host), so no cross-origin access is needed in the cluster.
