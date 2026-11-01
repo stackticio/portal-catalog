@@ -92,6 +92,18 @@ OPENSEARCH_VERIFY_CERTS = os.environ.get("OPENSEARCH_VERIFY_CERTS", "true").lowe
 # The link scopes the app user to an index pattern (e.g. "listings*"); the concrete
 # index we read/write is that pattern with the trailing wildcard stripped.
 OPENSEARCH_INDICES = os.environ.get("OPENSEARCH_INDICES", "listings*")
+
+# --- Shopping assistant and support: the `external_source_code-ai_gateway` link ---
+# The private model is reached through the stack's APISIX AI gateway (key auth, prompt guard, system
+# prompt, token budget live there). Unset AI_GATEWAY_URL or AI_GATEWAY_MODEL = assistant switched off.
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "").rstrip("/")
+AI_GATEWAY_MODEL = os.environ.get("AI_GATEWAY_MODEL", "")
+AI_GATEWAY_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "")
+AI_GATEWAY_API_KEY_HEADER = os.environ.get("AI_GATEWAY_API_KEY_HEADER", "apikey")
+# Answer length cap (tokens), read timeout between streamed chunks (seconds), per-user request rate.
+AI_ASSISTANT_MAX_TOKENS = int(os.environ.get("AI_ASSISTANT_MAX_TOKENS", "350"))
+AI_ASSISTANT_TIMEOUT = float(os.environ.get("AI_ASSISTANT_TIMEOUT", "120"))
+AI_ASSISTANT_RATE = os.environ.get("AI_ASSISTANT_RATE", "10/min")
 OPENSEARCH_LISTINGS_INDEX = OPENSEARCH_INDICES.split(",")[0].strip().rstrip("*") or "listings"
 
 # --- CORS/CSRF: the SPA is served same-origin (APISIX routes /api/catalog to this

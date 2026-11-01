@@ -5,6 +5,8 @@ from catalog.views import (
     CategoryViewSet,
     ListingViewSet,
     OrderViewSet,
+    assistant_chat,
+    assistant_status,
     auth_callback,
     auth_config,
     auth_login,
@@ -44,5 +46,8 @@ urlpatterns = [
     path("me/listings/", me_listings, name="me-listings"),
     path("me/bids/", me_bids, name="me-bids"),
     path("me/watchlist/", me_watchlist, name="me-watchlist"),
+    # Shopping assistant and support (private model behind the stack's AI gateway).
+    path("assistant/", assistant_status, name="assistant-status"),
+    path("assistant/chat/", assistant_chat, name="assistant-chat"),
     *router.urls,
 ]

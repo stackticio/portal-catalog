@@ -10,13 +10,15 @@ from django.db.models import Count, F, Max, Q
 from django.db.models.functions import Coalesce
 from django.http import JsonResponse, StreamingHttpResponse
 from rest_framework import viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, permission_classes, renderer_classes, throttle_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.renderers import BaseRenderer, JSONRenderer
+from rest_framework.throttling import SimpleRateThrottle
 
-from catalog import kafka_bridge, kafka_native, opensearch_client
+from catalog import assistant, kafka_bridge, kafka_native, opensearch_client
 from catalog.models import Bid, Category, Listing, Order, OrderItem, Profile, Watchlist
 from catalog.serializers import (
     BidSerializer,
@@ -716,3 +718,111 @@ def auth_register(request):
         except requests.RequestException:
             pass  # account exists; SPA falls back to the normal sign-in
     return Response(payload, status=201)
+
+
+# --------------------------------------------------------------------------- AI assistant
+
+
+class AssistantThrottle(SimpleRateThrottle):
+    """Per-user request rate for the assistant (AI_ASSISTANT_RATE, default 10/min): the signed-in
+    subject, else the client address. Stored in the shared cache (valkey when linked), so every
+    replica counts the same. The gateway's token limit is one budget for the whole app; this is
+    what stops one user from spending it."""
+
+    scope = "assistant"
+
+    def get_rate(self):
+        return settings.AI_ASSISTANT_RATE
+
+    def get_cache_key(self, request, view):
+        user = getattr(request, "user", None)
+        if getattr(user, "is_authenticated", False) and getattr(user, "sub", None):
+            ident = f"user:{user.sub}"
+        else:
+            ident = f"ip:{self.get_ident(request)}"
+        return self.cache_format % {"scope": self.scope, "ident": ident}
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def assistant_status(request):
+    """GET /api/catalog/assistant/ — whether the assistant is wired, so the UI can hide it."""
+    return Response({
+        "enabled": assistant.is_enabled(),
+        "model": settings.AI_GATEWAY_MODEL or None,
+        "modes": list(assistant.MODES),
+        "signed_in": bool(getattr(request.user, "is_authenticated", False)),
+    })
+
+
+class EventStreamRenderer(BaseRenderer):
+    """Lets content negotiation accept `Accept: text/event-stream`. Without it DRF answers 406
+    before the view runs. The stream itself is a StreamingHttpResponse; this renderer only renders
+    the JSON error bodies (400, 429, 503) a streaming client may receive instead."""
+
+    media_type = "text/event-stream"
+    format = "sse"
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        return b"" if data is None else json.dumps(data).encode()
+
+
+def _sse(event, payload):
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+@throttle_classes([AssistantThrottle])
+@renderer_classes([JSONRenderer, EventStreamRenderer])
+def assistant_chat(request):
+    """POST /api/catalog/assistant/chat/ — {"mode": "shop"|"support", "messages": [{role, content}]}.
+
+    Answers as Server-Sent Events: `meta` (mode, listings used as cards), `delta` chunks while the
+    model writes, then `done` (token usage when the model reports it) or `error` {code, message}.
+    Anonymous users may ask; support answers about orders and bids need a signed-in user."""
+    if not assistant.is_enabled():
+        return Response({"detail": "assistant not configured", "enabled": False}, status=503)
+
+    mode = request.data.get("mode", "shop")
+    if mode not in assistant.MODES:
+        return Response({"detail": f"mode must be one of {', '.join(assistant.MODES)}"}, status=400)
+    try:
+        history = assistant.clean_history(request.data.get("messages"))
+        messages, listings = assistant.build_messages(mode, history, request.user)
+    except assistant.AssistantError as exc:
+        return Response({"detail": exc.message, "code": exc.code}, status=400)
+
+    meta = {
+        "mode": mode,
+        "listings": [assistant.listing_card(lst) for lst in listings],
+        "signed_in": bool(getattr(request.user, "is_authenticated", False)),
+    }
+
+    def stream():
+        started = time.monotonic()
+        outcome, usage = "ok", None
+        yield _sse("meta", meta)
+        try:
+            for kind, value in assistant.stream_reply(messages):
+                if kind == "delta":
+                    yield _sse("delta", {"text": value})
+                else:
+                    usage = value
+            yield _sse("done", {"usage": usage})
+        except assistant.AssistantError as exc:
+            outcome = exc.code
+            yield _sse("error", {"code": exc.code, "message": exc.message})
+        except GeneratorExit:
+            outcome = "client_closed"
+            raise
+        finally:
+            assistant.log.info("assistant: mode=%s listings=%d outcome=%s seconds=%.1f usage=%s",
+                               mode, len(listings), outcome, time.monotonic() - started, usage)
+
+    resp = StreamingHttpResponse(stream(), content_type="text/event-stream")
+    resp["Cache-Control"] = "no-cache"
+    resp["X-Accel-Buffering"] = "no"  # disable proxy buffering (APISIX/nginx)
+    return resp
+
