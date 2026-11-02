@@ -30,7 +30,7 @@ from django.db.models import F, Max, Q
 from django.db.models.functions import Coalesce
 
 from catalog import opensearch_client
-from catalog.models import Bid, Listing, Order
+from catalog.models import Bid, Category, Listing, Order
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,10 @@ _STOPWORDS = {
     "this", "these", "those", "from", "under", "below", "less", "than", "max", "maximum",
     "about", "around", "like", "would", "could", "should", "recommend", "suggest", "gift",
     "price", "dollars", "usd", "budget", "item", "items", "listing", "listings", "thing",
+    # small talk, so a greeting or a thank-you is a conversation turn, not a product search
+    "hello", "hey", "hiya", "thanks", "thank", "cheers", "bye", "goodbye", "okay", "yes", "nope",
+    "sell", "sells", "selling", "offer", "offers", "morning", "afternoon", "evening", "great",
+    "cool", "awesome",
 }
 _PRICE_CAP = re.compile(
     r"(?:under|below|less than|cheaper than|at most|max(?:imum)?|up to|budget(?: of)?|<)\s*\$?\s*(\d+(?:[.,]\d+)?)",
@@ -168,14 +172,34 @@ def _listing_line(lst):
 
 
 SHOP_PROMPT = (
-    "Mode: shopping assistant. Recommend ONLY listings from the CATALOG below and refer to each "
-    "one as [#id] with its title and price exactly as given. Never invent listings, prices, "
-    "stock, shipping or seller details. If nothing fits, say so in one sentence and suggest a "
-    "better search phrase. Keep answers under 120 words; use a short list for several items."
+    "Mode: shopping assistant for this marketplace. Talk like a helpful shop assistant: plain, "
+    "friendly sentences, one or two of them before any list. Recommend ONLY listings from the "
+    "CATALOG below, at most three unless asked for more, each as [#id] with its title and price "
+    "exactly as given, described in your own words (never copy a catalog line or its separators). "
+    "Never invent listings, prices, stock, shipping or seller details. If nothing fits, say so in "
+    "one sentence and suggest a better search phrase. Keep answers under 120 words."
+)
+
+CHAT_PROMPT = (
+    "Mode: shopping assistant for this marketplace. The shopper has not asked for a product yet "
+    "(a greeting, thanks or a general question). Reply in one or two friendly sentences, answer "
+    "what you can from the CATEGORIES below, and ask what they are looking for. Do not list or "
+    "invent products, prices or stock. Keep it under 60 words."
 )
 
 
+def _wants_products(question):
+    """A greeting, thanks or small talk carries no product word and no price cap."""
+    return bool(_keywords(question)) or _max_price(question) is not None
+
+
 def shop_context(question):
+    if not _wants_products(question):
+        # No product words: a greeting or small talk. Listing the newest items here made the
+        # model answer "hi" with a catalogue dump; talk instead, grounded in the real categories.
+        names = list(Category.objects.order_by("order", "name").values_list("name", flat=True)[:12])
+        cats = ", ".join(names) if names else "(no categories yet)"
+        return f"{CHAT_PROMPT}\n\nCATEGORIES: {cats}", []
     listings = find_listings(question)
     if listings:
         body = "\n".join(_listing_line(lst) for lst in listings)
