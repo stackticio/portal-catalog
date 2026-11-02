@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 import uuid
 from decimal import Decimal, InvalidOperation
@@ -19,6 +20,18 @@ from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.throttling import SimpleRateThrottle
 
 from catalog import assistant, kafka_bridge, kafka_native, opensearch_client
+
+log = logging.getLogger(__name__)
+
+
+def _kafka_transport():
+    """Native client when the stack wired it (bootstrap + mTLS certs from the topic link),
+    the HTTP bridge only as a legacy fallback, None when Kafka is not linked at all."""
+    if kafka_native.is_native_enabled():
+        return kafka_native
+    if kafka_bridge.is_enabled():
+        return kafka_bridge
+    return None
 from catalog.models import Bid, Category, Listing, Order, OrderItem, Profile, Watchlist
 from catalog.serializers import (
     BidSerializer,
@@ -141,12 +154,17 @@ class ListingViewSet(viewsets.ModelViewSet):
             "created_at": bid.created_at.isoformat(),
         }
         published = False
-        if kafka_bridge.is_enabled():
+        transport = _kafka_transport()
+        if transport is not None:
             try:
-                kafka_bridge.produce(key=listing.id, value=event)
+                if transport is kafka_native:
+                    kafka_native.produce(key=listing.id, value=event, topic_name=settings.KAFKA_BIDS_TOPIC)
+                else:
+                    kafka_bridge.produce(key=listing.id, value=event)
                 published = True
             except Exception as exc:  # noqa: BLE001 - bid is saved; realtime is best-effort
                 event["publish_error"] = str(exc)
+                log.warning("bid %s saved but not published to %s: %s", bid.id, settings.KAFKA_BIDS_TOPIC, exc)
 
         return Response({**event, "published": published}, status=201)
 
@@ -207,34 +225,35 @@ class ListingViewSet(viewsets.ModelViewSet):
 
 
 def _publish_order_event(event_type, order):
-    """Best-effort publish of an order lifecycle event to the Kafka `orders` topic via
-    the HTTP bridge. No-op until the topic is wired (settings.KAFKA_ORDERS_TOPIC empty)
-    — the persisted Order is always the source of truth."""
+    """Best-effort publish of an order lifecycle event to the Kafka `orders` topic: the
+    native client when the stack wired it, the HTTP bridge as legacy fallback. No-op until
+    the topic is wired (settings.KAFKA_ORDERS_TOPIC empty) — the persisted Order is always
+    the source of truth."""
     topic = getattr(settings, "KAFKA_ORDERS_TOPIC", "")
+    if not topic:
+        return
+    value = {
+        "event": event_type,
+        "order_id": order.id,
+        "buyer": order.buyer,
+        "seller": order.seller,
+        "total": str(order.total),
+        "status": order.status,
+    }
+    if kafka_native.is_native_enabled():
+        try:
+            kafka_native.produce(key=order.id, value=value, topic_name=topic)
+        except Exception as exc:  # noqa: BLE001 - the order is saved; the event is best-effort
+            log.warning("order %s %s not published to %s: %s", order.id, event_type, topic, exc)
+        return
     bridge = getattr(settings, "KAFKA_BRIDGE_URL", "")
-    if not (topic and bridge):
+    if not bridge:
         return
     try:
         requests.post(
             f"{bridge}/topics/{topic}",
             headers={"Content-Type": "application/vnd.kafka.json.v2+json"},
-            data=json.dumps(
-                {
-                    "records": [
-                        {
-                            "key": str(order.id),
-                            "value": {
-                                "event": event_type,
-                                "order_id": order.id,
-                                "buyer": order.buyer,
-                                "seller": order.seller,
-                                "total": str(order.total),
-                                "status": order.status,
-                            },
-                        }
-                    ]
-                }
-            ),
+            data=json.dumps({"records": [{"key": str(order.id), "value": value}]}),
             timeout=5,
         )
     except requests.RequestException:
@@ -374,21 +393,27 @@ def me_watchlist(request):
 
 
 def bids_stream(request):
-    """Server-Sent Events stream of live bids, consumed from Kafka via the bridge.
+    """Server-Sent Events stream of live bids, consumed from Kafka (native client; the
+    HTTP bridge only as legacy fallback).
 
     Each connection gets its OWN consumer group (fan-out) so every browser sees every
     bid. Optional ?listing=<id> filters to one auction. Heartbeats keep the
     connection alive through proxies during quiet periods.
     """
-    if not kafka_bridge.is_enabled():
-        return JsonResponse({"detail": "kafka bridge not configured"}, status=503)
+    transport = _kafka_transport()
+    if transport is None:
+        return JsonResponse({"detail": "kafka not configured"}, status=503)
 
     listing_filter = request.GET.get("listing")
 
     def stream():
         yield "retry: 3000\n\n"
         try:
-            with kafka_bridge.consumer() as poll:
+            if transport is kafka_native:
+                consumer_cm = kafka_native.consumer(group_prefix="bids-sse", topic_name=settings.KAFKA_BIDS_TOPIC)
+            else:
+                consumer_cm = kafka_bridge.consumer()
+            with consumer_cm as poll:
                 last_beat = time.monotonic()
                 while True:
                     records = poll()

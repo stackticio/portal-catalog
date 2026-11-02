@@ -15,7 +15,11 @@ KafkaUser ACLs generated on the kafka side authorize it to Read/Write the topic.
 """
 import json
 import os
+import ssl
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 
 
 def bootstrap():
@@ -47,23 +51,112 @@ def _conf():
     return conf
 
 
+_PRODUCER = None
+_PRODUCER_LOCK = threading.Lock()
+
+
 def _producer():
+    """One producer for the whole process. librdkafka keeps the broker connections and
+    metadata warm, so a bid pays a network round trip, not a TLS handshake. A producer
+    per request did the handshake every time and was the slow path to avoid."""
+    global _PRODUCER
     from confluent_kafka import Producer  # imported lazily so the app boots without the wheel
-    return Producer(_conf())
+
+    with _PRODUCER_LOCK:
+        if _PRODUCER is None:
+            _PRODUCER = Producer(_conf())
+        return _PRODUCER
 
 
-def produce(key, value, timeout=10):
-    """Publish one record to the bids topic over native mTLS. Raises on failure."""
+def produce(key, value, topic_name=None, timeout=5):
+    """Publish one record (JSON value) over native mTLS and wait for the broker's ack.
+    Raises on failure; the caller decides whether that is fatal (bids: no, the bid is
+    already saved)."""
     p = _producer()
     result = {}
 
     def _cb(err, msg):
         result["err"] = err
 
-    p.produce(topic(), key=str(key), value=json.dumps(value), callback=_cb)
-    p.flush(timeout)
+    p.produce(topic_name or topic(), key=str(key), value=json.dumps(value), callback=_cb)
+    remaining = p.flush(timeout)
+    if remaining:
+        raise RuntimeError(f"kafka delivery timed out after {timeout}s ({remaining} record(s) in flight)")
     if result.get("err") is not None:
         raise RuntimeError(f"kafka delivery failed: {result['err']}")
+
+
+def client_cn():
+    """CN of this app's client certificate = its Kafka principal. The group ACL the stack
+    grants is a PREFIX on that CN (kafka topic-users.yaml), so every consumer group this
+    app creates must start with it. Read from the mounted cert; env override for tests."""
+    override = os.environ.get("KAFKA_CLIENT_CN")
+    if override:
+        return override
+    cert = os.environ.get("KAFKA_SSL_CERTIFICATE_LOCATION")
+    if cert:
+        try:
+            decoded = ssl._ssl._test_decode_cert(cert)  # noqa: SLF001 - stdlib, no extra wheel
+            for rdn in decoded.get("subject", ()):
+                for key, val in rdn:
+                    if key == "commonName":
+                        return val
+        except Exception:  # noqa: BLE001 - fall through to the stack's default principal
+            pass
+    return "stacktic-default-client"
+
+
+@contextmanager
+def consumer(group_prefix="sse", poll_timeout_ms=1000, topic_name=None):
+    """A short-lived consumer with its OWN group (fan-out: every caller sees every record),
+    the native counterpart of the bridge consumer. Yields a poll() returning a list of
+    {topic, key, value (parsed JSON), partition, offset}; closes the consumer on exit."""
+    from confluent_kafka import Consumer, KafkaError, KafkaException
+
+    conf = _conf()
+    conf.update(
+        {
+            "group.id": f"{client_cn()}-{group_prefix}-{uuid.uuid4().hex[:12]}",
+            "auto.offset.reset": "latest",
+            "enable.auto.commit": True,
+            "session.timeout.ms": 10000,
+        }
+    )
+    c = Consumer(conf)
+    try:
+        c.subscribe([topic_name or topic()])
+
+        def poll():
+            out = []
+            for msg in c.consume(num_messages=100, timeout=poll_timeout_ms / 1000):
+                err = msg.error()
+                if err is not None:
+                    if err.code() == KafkaError._PARTITION_EOF:  # noqa: SLF001 - librdkafka constant
+                        continue
+                    raise KafkaException(err)
+                raw = msg.value()
+                try:
+                    value = json.loads(raw) if raw is not None else None
+                except ValueError:
+                    value = {"raw": raw.decode("utf-8", "replace")}
+                key = msg.key()
+                out.append(
+                    {
+                        "topic": msg.topic(),
+                        "key": key.decode("utf-8", "replace") if key is not None else None,
+                        "value": value,
+                        "partition": msg.partition(),
+                        "offset": msg.offset(),
+                    }
+                )
+            return out
+
+        yield poll
+    finally:
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001 - the connection is gone either way
+            pass
 
 
 def health(timeout=10, do_produce=True):
